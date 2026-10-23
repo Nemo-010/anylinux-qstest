@@ -526,7 +526,14 @@ _sanity_check() {
 
 	if [ "$STRACE_MODE" = 1 ]; then
 		if _is_cmd xvfb-run; then
-			XVFB_CMD="xvfb-run -a --"
+			# -d waits for the X server to report its display, which means the
+			# 3 second STARTWAIT that -a needs can be skipped entirely, this is
+			# 3 seconds of the STRACE_TIME budget that the app actually gets
+			if xvfb-run --help 2>&1 | grep -q -- '--auto-display'; then
+				XVFB_CMD="xvfb-run -d -w 0 --"
+			else
+				XVFB_CMD="xvfb-run -a --"
+			fi
 		else
 			_err_msg "WARNING: xvfb-run was not detected on the system"
 			_err_msg "xvfb-run is used in strace mode to provide a display"
@@ -607,13 +614,52 @@ _kill_tree() {
 _kill_traced() {
 	if kill -0 -"$1" 2>/dev/null; then
 		kill -TERM -"$1" 2>/dev/null || :
-		sleep 1
+		# the app is only kept around to flush its LD_DEBUG output, which it
+		# has already done by the time we get here, so do not wait a full
+		# second on a process group that Xvfb and friends can outlive
+		i=0
+		while kill -0 -"$1" 2>/dev/null && [ "$i" -lt 2 ]; do
+			sleep 0.1
+			i=$((i + 1))
+		done
 		kill -KILL -"$1" 2>/dev/null || :
 	else
 		_kill_tree TERM "$1"
 		sleep 1
 		_kill_tree KILL "$1"
 	fi
+}
+
+# wait for a traced binary to stop opening libraries
+# STRACE_TIME is the maximum, not a fixed cost: an app that has already
+# loaded everything does not get anything from being kept alive longer
+# $1 log file  $2 maximum in tenths of a second
+_wait_for_dlopened() {
+	# how long to wait without seeing a new library before calling it done
+	# scaled to the budget so short lived helpers are not kept around as long
+	# as the main binary, but never less than half a second
+	idle_max=$(( $2 / 5 ))
+	[ "$idle_max" -ge 5 ]  || idle_max=5
+	[ "$idle_max" -le 10 ] || idle_max=10
+	i=0
+	idle=0
+	last=-1
+	while [ "$i" -lt "$2" ]; do
+		sleep 0.1
+		i=$((i + 1))
+		# only the libraries that actually get loaded matter here, LD_DEBUG
+		# also logs every path it searches and that keeps trickling in long
+		# after the last library was loaded, so watch the init count instead
+		count=$(grep -c 'calling init' "$1" 2>/dev/null) || count=0
+		if [ "$count" = "$last" ] && [ "$count" -gt 0 ]; then
+			idle=$((idle + 1))
+			[ "$idle" -lt "$idle_max" ] || return 0
+		else
+			idle=0
+		fi
+		last=$count
+	done
+	return 0
 }
 
 # do a basic test to make sure at least the application is not totally broken
@@ -1754,20 +1800,29 @@ _lib4bin_collect_ldd() {
 	#
 	# Verify with patchelf --print-needed and find the library instead
 	#
-	libs_basename=$(awk -F'/' '{print $NF}' "$_libs_list" | sort -u)
+	# every needed entry of every binary into one list, then a single grep
+	# tells which of them are not bundled yet. This used to fork twice per
+	# entry, which is a lot of forks for an application with many binaries
+	_needed=$TMPDIR/.needed.$$
+	_basenames=$TMPDIR/.basenames.$$
+	awk -F'/' '{print $NF}' "$_libs_list" | sort -u > "$_basenames"
+	:> "$_needed"
 	for b do
 		if _is_so "$b" || ! _is_elf "$b"; then
 			continue
 		fi
-		for s in $(patchelf --print-needed "$b" 2>/dev/null); do
-			if echo "$libs_basename" | grep -Fxq "$s"; then
-				continue # already included
-			elif [ -e "$LIB_DIR"/"$s" ]; then
+		patchelf --print-needed "$b" 2>/dev/null >> "$_needed" || :
+	done
+	if [ -s "$_needed" ]; then
+		sort -u "$_needed" | grep -vxF -f "$_basenames" > "$_needed.missing" || :
+		while IFS= read -r s; do
+			if [ -e "$LIB_DIR"/"$s" ]; then
 				# Was not found by ldd / LD_DEBUG=libs
 				printf '%s\n' "$LIB_DIR"/"$s" >> "$_libs_list"
 			fi
-		done
-	done
+		done < "$_needed.missing"
+	fi
+	rm -f "$_needed" "$_basenames" "$_needed.missing"
 
 	sort -u "$_libs_list" | sed '/^$/d'
 	rm -f "$_libs_list"
@@ -1820,7 +1875,7 @@ _lib4bin_collect_strace() {
 			_strace_time=1
 		fi
 
-		sleep "$_strace_time"
+		_wait_for_dlopened "$dlopened" $((_strace_time * 10))
 		_kill_traced $pid
 		wait $pid 2>/dev/null || :
 
@@ -4664,17 +4719,28 @@ set -- \
 	"$DST_LIB_DIR"/*/*/*/*/*/*.so*
 
 # include binaries in this check, since apps may statically link SDL and try dlopen pipewire
+nl='
+'
 for lib in "$@" "$SHARUN_BIN_DIR"/*; do
 	[ -f "$lib" ] || continue
+	# one patchelf call prints the rpath first and then the needed libs
+	# this used to be two calls per library, which added up fast
+	dyn=$(patchelf --print-rpath --print-needed "$lib" 2>/dev/null) || :
+	rpath=${dyn%%"$nl"*}
+	needed=${dyn#"$rpath"}
+	needed=${needed#"$nl"}
+
 	# make sure to remove any full rpath from the libs
-	if patchelf --print-rpath "$lib" | grep -q '^/'; then
-		patchelf --remove-rpath "$lib"
-		_echo "* removed full rpath from $lib"
-	fi
+	case "$rpath" in
+		/*)
+			patchelf --remove-rpath "$lib"
+			_echo "* removed full rpath from $lib"
+			;;
+	esac
 
 	# also remove full paths from needed libs, for example
 	# a library may depend on /usr/lib/libkek.so instead of libkek.so
-	patchelf --print-needed "$lib" | while IFS="" read -r l; do
+	for l in $needed; do
 		case "$l" in
 			/*)
 				patchelf --replace-needed "$l" "${l##*/}" "$lib"
